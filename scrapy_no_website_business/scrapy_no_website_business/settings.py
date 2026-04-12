@@ -33,8 +33,4 @@ SPIDER_MIDDLEWARES = {
     "scrapy_no_website_business.middlewares.SpiderLifecycleMiddleware": 543,
 }
 
-ITEM_PIPELINES = {
-    "scrapy_no_website_business.pipelines.DedupeEmailPipeline": 300,
-}
-
 FEED_EXPORT_ENCODING = "utf-8"

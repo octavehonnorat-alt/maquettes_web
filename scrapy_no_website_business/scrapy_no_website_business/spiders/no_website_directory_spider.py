@@ -10,14 +10,14 @@ from scrapy_no_website_business.items import DirectoryBusinessItem
 class NoWebsiteDirectorySpider(scrapy.Spider):
     name = "no_website_directory"
     allowed_domains = []
+    DEFAULT_MAX_PAGES = 20
 
     custom_settings = {
         "LOG_LEVEL": "INFO",
     }
 
-    EMAIL_REGEX = re.compile(
-        r"(?i)(?<![a-z0-9._%+-])[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}(?![a-z0-9._%+-])"
-    )
+    EMAIL_REGEX = re.compile(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b")
+    MAX_PAGE_TEXT_LENGTH = 200000
 
     OBFUSCATION_REGEXES = [
         (re.compile(r"(?i)\s*\[\s*at\s*\]\s*"), "@"),
@@ -44,6 +44,12 @@ class NoWebsiteDirectorySpider(scrapy.Spider):
         "a[aria-label*='Next' i]::attr(href)",
         "a.next::attr(href)",
     ]
+    DETAIL_LINK_SELECTORS = [
+        "h1 a::attr(href)",
+        "h2 a::attr(href)",
+        "h3 a::attr(href)",
+        "a[href]:not([href^='mailto:']):not([href^='tel:'])::attr(href)",
+    ]
     WEBSITE_SELECTORS = (
         "a[itemprop='url']::attr(href), "
         "a[class*='site']::attr(href), "
@@ -52,7 +58,7 @@ class NoWebsiteDirectorySpider(scrapy.Spider):
         "a[aria-label*='website' i]::attr(href)"
     )
 
-    def __init__(self, start_urls=None, allowed_domains=None, max_pages=20, *args, **kwargs):
+    def __init__(self, start_urls=None, allowed_domains=None, max_pages=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if start_urls:
             self.start_urls = [u.strip() for u in start_urls.split(",") if u.strip()]
@@ -70,7 +76,12 @@ class NoWebsiteDirectorySpider(scrapy.Spider):
                 }
             )
 
-        self.max_pages = int(max_pages)
+        try:
+            self.max_pages = int(max_pages if max_pages is not None else self.DEFAULT_MAX_PAGES)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"max_pages must be an integer, got: {max_pages}") from exc
+        if self.max_pages < 1:
+            raise ValueError(f"max_pages must be >= 1, got: {self.max_pages}")
 
     def start_requests(self):
         if not self.start_urls:
@@ -88,7 +99,11 @@ class NoWebsiteDirectorySpider(scrapy.Spider):
             if not item:
                 continue
 
-            detail_link = block.css("a::attr(href)").get()
+            detail_link = ""
+            for selector in self.DETAIL_LINK_SELECTORS:
+                detail_link = block.css(selector).get(default="").strip()
+                if detail_link:
+                    break
             if detail_link:
                 yield response.follow(
                     detail_link,
@@ -124,16 +139,26 @@ class NoWebsiteDirectorySpider(scrapy.Spider):
             ).xpath(".//text()[normalize-space()]").getall()
         )
 
-        emails = self._extract_emails(" ".join([item.get("description", ""), contact_text, page_text, json_ld_text]))
+        email_set = set(item.get("emails") or [])
+        email_set.update(self._extract_emails(item.get("description", "")))
+        email_set.update(self._extract_emails(contact_text))
+        email_set.update(self._extract_emails(json_ld_text))
+        if not email_set:
+            if len(page_text) > self.MAX_PAGE_TEXT_LENGTH:
+                self.logger.debug(
+                    "Page text truncated for email extraction at %s chars",
+                    self.MAX_PAGE_TEXT_LENGTH,
+                )
+            email_set.update(self._extract_emails(page_text[: self.MAX_PAGE_TEXT_LENGTH]))
 
         item["source_url"] = response.url
-        item["emails"] = sorted(set((item.get("emails") or []) + emails))
+        item["emails"] = sorted(email_set)
         yield item
 
     def _iter_listing_blocks(self, response):
         for selector in self.LISTING_BLOCK_SELECTORS:
             blocks = response.css(selector)
-            if len(blocks) > 0:
+            if blocks:
                 return blocks
         return []
 
@@ -200,8 +225,8 @@ class NoWebsiteDirectorySpider(scrapy.Spider):
         candidates = self.EMAIL_REGEX.findall(normalized)
         valid = []
         for email in candidates:
-            email = email.lower().strip(" .,;:()[]{}<>'\"")
-            if ".." in email or email.startswith("@") or email.endswith("@"):
+            email = email.lower().strip(" .,;:()[]{}<>\"")
+            if ".." in email:
                 continue
             local, _, domain = email.rpartition("@")
             if not local or not domain or domain.startswith(".") or domain.endswith("."):
@@ -214,4 +239,4 @@ class NoWebsiteDirectorySpider(scrapy.Spider):
         if not value:
             return False
         lower_value = value.lower()
-        return lower_value.startswith("http") and not lower_value.startswith("mailto:")
+        return lower_value.startswith(("http://", "https://", "www."))
